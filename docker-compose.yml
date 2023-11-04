@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+
+  adder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: actortest
+    container_name: server
+    command:
+      - "python"
+      - "-m"
+      - "actor.adder"
+    ports:
+      - 8000:8000
+
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: actortest
+    container_name: client
+    command:
+      - "python"
+      - "-m"
+      - "actor.client"
+    depends_on:
+      - adder
+
+  # rabbitmq:
+  #   image: rabbitmq:3-management-alpine
+  #   container_name: 'rabbitmq'
+  #   ports:
+  #       - 5672:5672
+  #       - 15672:15672
