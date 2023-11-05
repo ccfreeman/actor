@@ -6,7 +6,8 @@ name = "pypi"
 [packages]
 fastapi = "==0.104.0"
 uvicorn = "==0.23.2"
-aiohttp = "*"
+aiohttp = "3.8.6"
+aio-pika = "==9.3.0"
 
 [dev-packages]
 

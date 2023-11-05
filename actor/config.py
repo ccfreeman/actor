@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 import aiohttp
 
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 
 
 @dataclass

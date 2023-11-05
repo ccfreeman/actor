@@ -1,14 +1,30 @@
 import logging
 import functools
-from typing import Self, TypeVar, Callable, Generator
-from abc import ABC
+import asyncio
+import signal
+import json
+from types import FrameType
+from typing import (
+    Self,
+    TypeVar,
+    Callable,
+    Generator,
+    Optional,
+    List,
+    Type,
+    MutableMapping,
+)
+from abc import ABC, abstractmethod
+from uuid import uuid4
 
 import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
+import aio_pika
+import aio_pika.abc
 
 from .config import CONFIG
-from .connectors import HttpConnector
+from .connectors import HttpConnector, RabbitMqConnector, AbstractConnector
 
 
 logger = logging.getLogger(__name__)
@@ -27,18 +43,13 @@ def get_funcs(_obj: object) -> Generator[Callable, None, None]:
             yield getattr(_obj, func)
 
 
-def route(methods: list[str]):
-    """Mark a method on a class for exposure. This is handled by adding a `methods`
-    attribute to the function, which is then used by the `app_wrapper` class to add the
-    function to the FastAPI app. This way we can detect which methods a user wants
-    exposed through the FastAPI app.
+class Server(uvicorn.Server):
+    """A wrapper around a Uvicorn server. Adds some extra logging to add visibility
+    to server cancellation events.
     """
 
-    def wrapper(func):
-        func.methods = methods
-        return func
-
-    return wrapper
+    def install_signal_handlers(self) -> None:
+        """We don't want Uvicorn to handle signals, we'll do it ourselves"""
 
 
 class ActorServer:
@@ -48,10 +59,11 @@ class ActorServer:
     them to the FastAPI app.
     """
 
-    def __init__(self, cls: type[T], *args, **kwargs):
-        self.cls = cls
-        self.obj = cls(*args, **kwargs)
-        self.app = FastAPI(title=self.cls.__name__, description=self.cls.__doc__)
+    def __init__(self, obj: T):
+        self.obj = obj
+        self.app = FastAPI(
+            title=self.obj.__class__.__name__, description=self.obj.__class__.__doc__
+        )
         for func in get_funcs(self.obj):
             self.app.add_api_route(
                 path=f"/{func.__name__}",
@@ -61,14 +73,124 @@ class ActorServer:
                 methods=func.methods,
                 description=func.__doc__,
             )
+        self.app.add_api_route(
+            path="/healthz",
+            tags=["Health"],
+            endpoint=self.healthz,
+            methods=["GET"],
+        )
+
+    async def healthz(self) -> bool:
+        """Application health endpoint."""
+        return True
 
     async def run(self) -> None:
         """Run the FastAPI app."""
-        server = uvicorn.Server(
+        server = Server(
             # uvicorn.Config(app=self.app, host="127.0.0.1", port=8000, reload=True)
             uvicorn.Config(app=self.app, host="0.0.0.0", port=8000)
         )
-        await server.serve()
+        try:
+            await server.serve()
+        except asyncio.CancelledError:
+            logger.info("Uvicorn server was cancelled")
+            await server.shutdown()
+
+
+class ActorQueueConsumer:
+    """A class to handle connections to the message broker."""
+
+    def __init__(self, obj: T):
+        self.obj = obj
+
+    async def run(self) -> None:
+        while True:
+            try:
+                await self.__consume()
+            except Exception:
+                logger.exception("Consume method ended unexpectedly")
+
+    async def __consume(self) -> None:
+        """Run the consumer process"""
+        async with await aio_pika.connect_robust(
+            "amqp://guest:guest@rabbitmq:5672/"
+        ) as connection:
+            queue_name = self.obj.__class__.__name__
+            # Creating channel
+            channel: aio_pika.abc.AbstractChannel = await connection.channel(
+                on_return_raises=True
+            )
+            exchange = channel.default_exchange
+
+            # Declaring queue
+            queue: aio_pika.abc.AbstractQueue = await channel.declare_queue(
+                queue_name, auto_delete=True
+            )
+
+            async with queue.iterator() as queue_iter:
+                # Cancel consuming after __aexit__
+                async for message in queue_iter:
+                    async with message.process(requeue=True):
+                        body = json.loads(message.body)
+                        func = message.headers["func"]
+                        methods = message.headers["method"]
+                        f = getattr(self.obj, func)
+                        response = await f(**body)
+                        await exchange.publish(
+                            message=aio_pika.Message(
+                                body=json.dumps(response).encode("utf-8"),
+                                correlation_id=message.correlation_id,
+                            ),
+                            routing_key=message.reply_to,
+                        )
+
+
+class CallbackConsumer:
+    """Consumer to receive replies"""
+
+    def __init__(
+        self, futures: MutableMapping[str, asyncio.Future], connector: RabbitMqConnector
+    ):
+        self.futures = futures
+        self.connector = connector
+        self.callback_queue: aio_pika.abc.AbstractQueue = None
+        self.__proc: asyncio.Task = None
+        self.__ready = asyncio.Event()
+
+    async def ready(self) -> None:
+        await self.__ready.wait()
+            
+    def run(self) -> None:
+        self.__proc = asyncio.create_task(self.__consume())
+
+    async def close(self) -> None:
+        self.__proc.cancel()
+        try:
+            await self.__proc
+        except:
+            logger.exception("Boo boo")
+
+    async def __process_message(
+        self, message: aio_pika.abc.AbstractIncomingMessage
+    ) -> None:
+        logger.info("We got something!")
+        xid = message.correlation_id
+        body = json.loads(message.body)
+        future = self.futures.pop(xid)
+        future.set_result(body)
+
+    async def __consume(self) -> None:
+        """Run the consumer process"""
+        try:
+            channel = await self.connector.channel
+            self.callback_queue = await channel.declare_queue(exclusive=True)
+            self.__ready.set()
+            await self.callback_queue.consume(
+                self.__process_message, no_ack=True, timeout=None
+            )
+        except:
+            logger.exception("Shit! Consume process has a problem")
+        logger.warning("Damn, the reply consumer is done")
 
 
 class _Proxy:
@@ -78,10 +200,23 @@ class _Proxy:
     method to return a partial function that calls the server.
     """
 
-    def __init__(self, cls: type[T]):
+    def __init__(
+        self, cls: type[T], connector: Type[AbstractConnector] = HttpConnector
+    ):
         functools.update_wrapper(self, cls)
         self.cls = cls
-        self.connector = HttpConnector(service_name=self.cls.__name__)
+        self.connector = connector(service_name=self.cls.__name__)
+        self.futures: MutableMapping[str, asyncio.Future] = {}
+        self.callback_consumer: CallbackConsumer = CallbackConsumer(
+            futures=self.futures, connector=self.connector
+        )
+        # The args are used to set the method active on each server endpoint
+        kwargs = {}
+        if isinstance(self.connector, RabbitMqConnector):
+            self.callback_consumer.run()
+            kwargs.update(
+                {"futures": self.futures, "callback_consumer": self.callback_consumer}
+            )
         for func in get_funcs(self.cls):
             setattr(
                 self,
@@ -90,14 +225,27 @@ class _Proxy:
                     self.connector,
                     func=func.__name__,
                     method=func.methods[0],
+                    **kwargs
                 ),
             )
+
+    async def close(self) -> None:
+        tasks = [self.connector.close()]
+        if isinstance(self.callback_consumer, CallbackConsumer):
+            tasks.append(self.callback_consumer.close())
+        await asyncio.gather(*tasks)
+
+    async def ready(self) -> None:
+        ready_tasks = [self.connector.ready()]
+        if isinstance(self.connector, RabbitMqConnector):
+            ready_tasks.append(self.callback_consumer.ready())
+        await asyncio.gather(*ready_tasks)
 
     async def __aenter__(self) -> T:
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        await self.connector.close()
+        await self.close()
 
 
 class Actor(ABC):
@@ -125,19 +273,42 @@ class Actor(ABC):
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        await self.close()
-
-    async def close(self) -> None:
         ...
+
+    async def ready(self) -> None:
+        """Await the readiness of the actor"""
 
     @classmethod
     async def serve(cls: type[T], *args, **kwargs) -> None:
         """Serve the actor. This method is used to start the FastAPI server."""
-        server = ActorServer(cls, *args, **kwargs)
-        await server.run()
+        obj = cls(*args, **kwargs)
+        server = ActorServer(obj)
+        consumer = ActorQueueConsumer(obj)
+        loop = asyncio.get_event_loop()
+
+        async with asyncio.TaskGroup() as task_group:
+            server_task = task_group.create_task(server.run())
+            consumer_task = task_group.create_task(consumer.run())
+
+            def cancel_tasks():
+                server_task.cancel()
+                consumer_task.cancel()
+
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, cancel_tasks)
+        try:
+            await asyncio.gather(server_task, consumer_task)
+        except asyncio.CancelledError:
+            pass
+        logger.info("serving all done")
 
     @classmethod
-    def proxy(cls: type[T], *args, **kwargs) -> T:
+    def proxy(
+        cls: type[T],
+        connector: Type[AbstractConnector] = HttpConnector,
+        *args,
+        **kwargs,
+    ) -> T:
         """Proxy class for the client. This class is used to create a proxy object that
         exposes the same methods as the class passed in, but instead of calling the
         methods on the object, it calls them on the server. This is done by using the
@@ -146,4 +317,4 @@ class Actor(ABC):
         This is a factory method that returns an initialized class instance of the
         proxied class given as an argument.
         """
-        return _Proxy(cls)
+        return _Proxy(cls, connector=connector, *args, **kwargs)

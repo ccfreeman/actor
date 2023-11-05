@@ -5,6 +5,7 @@ import signal
 
 from .config import CONFIG
 from .adder import Adder, MultiplyOperands
+from .connectors import HttpConnector, RabbitMqConnector
 
 
 logger = logging.getLogger(__name__)
@@ -25,10 +26,13 @@ async def ops(
 
 
 async def looper():
-    try:
-        semaphore = asyncio.BoundedSemaphore(100)
-        async with Adder.proxy() as adder:
+    semaphore = asyncio.BoundedSemaphore(100)
+    async with Adder.proxy(connector=RabbitMqConnector) as adder:
+        try:
+            await adder.ready()
             while True:
+                r = await adder.add(x=1, y=2)
+                logger.info("The answer is %r", r)
                 await asyncio.gather(
                     *(
                         ops(
@@ -41,21 +45,16 @@ async def looper():
                     )
                 )
                 await asyncio.sleep(2)
-    except asyncio.CancelledError:
-        logger.info("looper cancelled")
-    except:
-        logger.exception("looper error")
+        except asyncio.CancelledError:
+            logger.info("looper cancelled")
     logger.info("looper exiting")
 
 
 async def main():
-    shutdown = asyncio.Event()
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, shutdown.set)
     looper_task = asyncio.create_task(looper())
-    await shutdown.wait()
-    looper_task.cancel()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, looper_task.cancel)
     await looper_task
     logger.info("bye!")
 
