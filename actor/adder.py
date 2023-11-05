@@ -4,7 +4,6 @@ from typing import Optional
 
 from pydantic import BaseModel
 
-from .config import CONFIG
 from .actor import Actor
 
 
@@ -38,6 +37,7 @@ class Adder(Actor):
     @Actor.route(methods=["POST"])
     async def multiply(
         self, x: int | float, y: int | float, ops: Optional[MultiplyOperands] = None
+        # self, x: int | float, y: int | float, ops: MultiplyOperands
     ) -> int | float:
         res = 1
         if ops is not None:
@@ -46,9 +46,5 @@ class Adder(Actor):
         return res * x * y
 
 
-async def main():
-    await Adder.serve()
-
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(Adder.serve())

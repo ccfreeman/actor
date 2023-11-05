@@ -3,25 +3,26 @@ import functools
 import asyncio
 import signal
 import json
-from types import FrameType
+import inspect
 from typing import (
     Self,
     TypeVar,
     Callable,
     Generator,
-    Optional,
-    List,
     Type,
     MutableMapping,
+    Union,
+    Any,
+    get_origin,
+    get_args,
 )
-from abc import ABC, abstractmethod
-from uuid import uuid4
+from abc import ABC
 
 import uvicorn
-from fastapi import FastAPI
-from pydantic import BaseModel
 import aio_pika
 import aio_pika.abc
+from fastapi import FastAPI
+from pydantic import BaseModel
 
 from .config import CONFIG
 from .connectors import HttpConnector, RabbitMqConnector, AbstractConnector
@@ -109,40 +110,54 @@ class ActorQueueConsumer:
                 await self.__consume()
             except Exception:
                 logger.exception("Consume method ended unexpectedly")
+            logger.info("Running again")
 
     async def __consume(self) -> None:
         """Run the consumer process"""
-        async with await aio_pika.connect_robust(
-            "amqp://guest:guest@rabbitmq:5672/"
-        ) as connection:
-            queue_name = self.obj.__class__.__name__
-            # Creating channel
-            channel: aio_pika.abc.AbstractChannel = await connection.channel(
-                on_return_raises=True
-            )
-            exchange = channel.default_exchange
+        queue_name = self.obj.__class__.__name__
+        # Creating channel
+        conn = await CONFIG.CONN.connection
+        channel: aio_pika.abc.AbstractChannel = await conn.channel(
+            on_return_raises=True
+        )
+        exchange = channel.default_exchange
 
-            # Declaring queue
-            queue: aio_pika.abc.AbstractQueue = await channel.declare_queue(
-                queue_name, auto_delete=True
-            )
+        # Declaring queue
+        queue: aio_pika.abc.AbstractQueue = await channel.declare_queue(
+            queue_name, auto_delete=True
+        )
 
-            async with queue.iterator() as queue_iter:
-                # Cancel consuming after __aexit__
-                async for message in queue_iter:
-                    async with message.process(requeue=True):
-                        body = json.loads(message.body)
-                        func = message.headers["func"]
-                        methods = message.headers["method"]
-                        f = getattr(self.obj, func)
-                        response = await f(**body)
-                        await exchange.publish(
-                            message=aio_pika.Message(
-                                body=json.dumps(response).encode("utf-8"),
-                                correlation_id=message.correlation_id,
-                            ),
-                            routing_key=message.reply_to,
-                        )
+        async with queue.iterator() as queue_iter:
+            async for message in queue_iter:
+                async with message.process(requeue=True):
+                    body: dict[str, Any] = json.loads(message.body)
+                    func = message.headers["func"]
+                    methods = message.headers["method"]
+                    f = getattr(self.obj, func)
+                    # We need to convert any pydantic models to their type from the
+                    # jsonable dictionaries we represent them as in messages.
+                    # We do this by inspecting the function signature, iterating through
+                    # the parameters, handling optional args, and then casting the dict
+                    # object into the pydantic class
+                    f_signature = inspect.signature(f)
+                    for key, val in body.items():
+                        arg_type_annotation = f_signature.parameters[key].annotation
+                        if get_origin(arg_type_annotation) is Union:
+                            for arg_type in get_args(arg_type_annotation):
+                                if isinstance(arg_type, type(BaseModel)):
+                                    arg_type_annotation = arg_type
+
+                        if isinstance(arg_type_annotation, type(BaseModel)):
+                            model: BaseModel = arg_type_annotation
+                            body[key] = model.model_validate(val)
+                    response = await f(**body)
+                    await exchange.publish(
+                        message=aio_pika.Message(
+                            body=json.dumps(response).encode("utf-8"),
+                            correlation_id=message.correlation_id,
+                        ),
+                        routing_key=message.reply_to,
+                    )
 
 
 class CallbackConsumer:
@@ -159,21 +174,21 @@ class CallbackConsumer:
 
     async def ready(self) -> None:
         await self.__ready.wait()
-            
+
     def run(self) -> None:
         self.__proc = asyncio.create_task(self.__consume())
 
     async def close(self) -> None:
-        self.__proc.cancel()
-        try:
-            await self.__proc
-        except:
-            logger.exception("Boo boo")
+        if isinstance(self.__proc, asyncio.Task):
+            self.__proc.cancel()
+            try:
+                await self.__proc
+            except:
+                logger.exception("Boo boo")
 
     async def __process_message(
         self, message: aio_pika.abc.AbstractIncomingMessage
     ) -> None:
-        logger.info("We got something!")
         xid = message.correlation_id
         body = json.loads(message.body)
         future = self.futures.pop(xid)
@@ -184,7 +199,7 @@ class CallbackConsumer:
         try:
             channel = await self.connector.channel
             self.callback_queue = await channel.declare_queue(exclusive=True)
-            self.__ready.set()
+            self.__ready.set() # Go!
             await self.callback_queue.consume(
                 self.__process_message, no_ack=True, timeout=None
             )
@@ -222,15 +237,12 @@ class _Proxy:
                 self,
                 func.__name__,
                 functools.partial(
-                    self.connector,
-                    func=func.__name__,
-                    method=func.methods[0],
-                    **kwargs
+                    self.connector, func=func.__name__, method=func.methods[0], **kwargs
                 ),
             )
 
     async def close(self) -> None:
-        tasks = [self.connector.close()]
+        tasks = []
         if isinstance(self.callback_consumer, CallbackConsumer):
             tasks.append(self.callback_consumer.close())
         await asyncio.gather(*tasks)
@@ -242,6 +254,7 @@ class _Proxy:
         await asyncio.gather(*ready_tasks)
 
     async def __aenter__(self) -> T:
+        await self.ready()
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -300,6 +313,7 @@ class Actor(ABC):
             await asyncio.gather(server_task, consumer_task)
         except asyncio.CancelledError:
             pass
+        await CONFIG.CONN.close()
         logger.info("serving all done")
 
     @classmethod

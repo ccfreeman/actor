@@ -2,6 +2,7 @@ import logging
 import asyncio
 import random
 import signal
+import time
 
 from .config import CONFIG
 from .adder import Adder, MultiplyOperands
@@ -14,12 +15,16 @@ logger = logging.getLogger(__name__)
 async def ops(
     adder: Adder, a: int | float, b: int | float, semaphore: asyncio.BoundedSemaphore
 ) -> None:
+    t_begin = time.time()
     logger.info("Calling")
     async with semaphore:
         async with asyncio.TaskGroup() as task_group:
-            mult = task_group.create_task(adder.multiply(x=a, y=b))
+            mult = task_group.create_task(
+                adder.multiply(x=a, y=b, ops=MultiplyOperands(ops=[a, b]))
+            )
             add = task_group.create_task(adder.add(x=a, y=b))
             sub = task_group.create_task(adder.subtract(x=a, y=b))
+    logger.info("Took %.3f seconds", time.time() - t_begin)
     logger.info("%r * %r = %r", a, b, mult.result())
     logger.info("%r + %r = %r", a, b, add.result())
     logger.info("%r - %r = %r", a, b, sub.result())
@@ -29,10 +34,9 @@ async def looper():
     semaphore = asyncio.BoundedSemaphore(100)
     async with Adder.proxy(connector=RabbitMqConnector) as adder:
         try:
-            await adder.ready()
             while True:
-                r = await adder.add(x=1, y=2)
-                logger.info("The answer is %r", r)
+                # r = await adder.add(x=1, y=2)
+                # logger.info("The answer is %r", r)
                 await asyncio.gather(
                     *(
                         ops(
@@ -47,6 +51,7 @@ async def looper():
                 await asyncio.sleep(2)
         except asyncio.CancelledError:
             logger.info("looper cancelled")
+    await CONFIG.CONN.close()
     logger.info("looper exiting")
 
 
